@@ -5,6 +5,7 @@ logic can never drift out of sync between the two entry points -- that drift is 
 what caused the caption-length bug earlier, when send logic lived in two places.
 """
 
+import concurrent.futures
 import os
 import re
 
@@ -48,52 +49,7 @@ def _format_reference(sources):
     return f"Reference: {top['title']} — {top['uri']}"
 
 
-def handle_note(note_text, image_dir="/tmp"):
-    """
-    Runs the full pipeline for one note and sends the result to the configured
-    Telegram channel (either the rejection message or the finished post+image).
-    Returns a result dict the caller can log or save locally.
-    """
-    system_prompt = persona.build_system_prompt()
-    raw, _draft_sources = gemini_client.generate_post_text(system_prompt, note_text)
-    score, draft_text = _parse_scored_response(raw)
-
-    if score <= 5:
-        telegram_client.send_message(
-            telegram_client.CHANNEL_ID,
-            f"{REJECTION_MESSAGE}\n\nPost rating: {score}/10",
-        )
-        return {"score": score, "outcome": "rejected"}
-
-    # Word-count target is a real requirement, not a suggestion -- LLMs miss it often
-    # enough on the first pass that a bounded revision loop is worth the extra latency.
-    revisions = 0
-    while _word_count(draft_text) not in range(MIN_WORDS, MAX_WORDS + 1) and revisions < MAX_LENGTH_REVISIONS:
-        revisions += 1
-        current = _word_count(draft_text)
-        direction = "Shorten" if current > MAX_WORDS else "Expand"
-        raw, _draft_sources = gemini_client.generate_post_text(
-            system_prompt,
-            note_text,
-            revision_note=(
-                f"Your previous draft was {current} words. {direction} it to land between "
-                f"{MIN_WORDS} and {MAX_WORDS} words. Keep the same facts, voice, and score -- "
-                f"do not add any new claims just to hit the count."
-            ),
-        )
-        score, draft_text = _parse_scored_response(raw)
-
-    # Dedicated reference search, decoupled from whatever incidental grounding happened
-    # while drafting -- guarantees a real search is actually attempted every time.
-    reference_sources = gemini_client.find_reference(note_text)
-    reference_block = _format_reference(reference_sources)
-
-    caption_parts = [draft_text]
-    if reference_block:
-        caption_parts.append(reference_block)
-    caption_parts.append(f"Post rating: {score}/10")
-    full_caption = "\n\n".join(caption_parts)
-
+def _build_image(draft_text, image_dir):
     visual_concept = gemini_client.generate_visual_concept(draft_text)
     image_prompt = (
         f"{visual_concept}\n\n"
@@ -104,9 +60,70 @@ def handle_note(note_text, image_dir="/tmp"):
     )
     image_path = os.path.join(image_dir, "meera_linkedin_image.png")
     gemini_client.generate_image(image_prompt, image_path)
+    return image_path
+
+
+def handle_note(note_text, image_dir="/tmp"):
+    """
+    Runs the full pipeline for one note and sends the result to the configured
+    Telegram channel (either the rejection message or the finished post+image).
+    Returns a result dict the caller can log or save locally.
+    """
+    print("pipeline: scoring + drafting...")
+    system_prompt = persona.build_system_prompt()
+    raw, _draft_sources = gemini_client.generate_post_text(system_prompt, note_text)
+    score, draft_text = _parse_scored_response(raw)
+    print(f"pipeline: score={score}")
+
+    if score <= 5:
+        telegram_client.send_message(
+            telegram_client.CHANNEL_ID,
+            f"{REJECTION_MESSAGE}\n\nPost rating: {score}/10",
+        )
+        print("pipeline: rejection message sent")
+        return {"score": score, "outcome": "rejected"}
+
+    # Word-count target is a real requirement, not a suggestion -- LLMs miss it often
+    # enough on the first pass that a bounded revision loop is worth the extra latency.
+    revisions = 0
+    while _word_count(draft_text) not in range(MIN_WORDS, MAX_WORDS + 1) and revisions < MAX_LENGTH_REVISIONS:
+        revisions += 1
+        current = _word_count(draft_text)
+        direction = "Shorten" if current > MAX_WORDS else "Expand"
+        print(f"pipeline: word count {current} out of range, revision {revisions}...")
+        raw, _draft_sources = gemini_client.generate_post_text(
+            system_prompt,
+            note_text,
+            revision_note=(
+                f"Your previous draft was {current} words. {direction} it to land between "
+                f"{MIN_WORDS} and {MAX_WORDS} words. Keep the same facts, voice, and score -- "
+                f"do not add any new claims just to hit the count."
+            ),
+        )
+        score, draft_text = _parse_scored_response(raw)
+    print(f"pipeline: final word count {_word_count(draft_text)}")
+
+    # Reference search and image generation are independent of each other -- run them
+    # concurrently instead of back-to-back to keep the request under Vercel's time
+    # budget (this pipeline was timing out at 60s before this and the maxDuration bump).
+    print("pipeline: reference search + image generation (parallel)...")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        ref_future = executor.submit(gemini_client.find_reference, note_text)
+        image_future = executor.submit(_build_image, draft_text, image_dir)
+        reference_sources = ref_future.result()
+        image_path = image_future.result()
+    print(f"pipeline: got {len(reference_sources)} reference source(s), image ready")
+
+    reference_block = _format_reference(reference_sources)
+    caption_parts = [draft_text]
+    if reference_block:
+        caption_parts.append(reference_block)
+    caption_parts.append(f"Post rating: {score}/10")
+    full_caption = "\n\n".join(caption_parts)
 
     telegram_client.send_photo(telegram_client.CHANNEL_ID, image_path)
     telegram_client.send_long_message(telegram_client.CHANNEL_ID, full_caption)
+    print("pipeline: sent to channel")
 
     return {
         "score": score,

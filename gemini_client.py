@@ -18,23 +18,51 @@ TEXT_MODEL = "gemini-flash-latest"
 IMAGE_MODEL = "gemini-2.5-flash-image"
 
 
-def generate_post_text(system_prompt, note_text):
+def _extract_sources(candidate):
+    """
+    Pulls real, verifiable URLs out of the API's own grounding metadata -- never from
+    text the model wrote itself. A model can hallucinate a plausible-looking citation
+    even mid-sentence in an otherwise grounded response; the grounding metadata is the
+    one part of the response that's guaranteed to reflect an actual search result.
+    """
+    grounding = candidate.get("groundingMetadata") or {}
+    chunks = grounding.get("groundingChunks") or []
+    sources = []
+    seen = set()
+    for chunk in chunks:
+        web = chunk.get("web") or {}
+        uri = web.get("uri")
+        title = web.get("title") or uri
+        if uri and uri not in seen:
+            seen.add(uri)
+            sources.append({"title": title, "uri": uri})
+    return sources
+
+
+def generate_post_text(system_prompt, note_text, revision_note=None):
     """
     Drafts the LinkedIn post. Google Search grounding is enabled so that any general,
     non-Skinstinct-specific scientific claim Meera's voice would make (e.g. how a
     named compound behaves) can be checked rather than guessed — it must NOT be used
     to invent Skinstinct-specific facts, stats, or stories; the persona prompt already
     instructs the model on that boundary.
+
+    revision_note: optional feedback for a follow-up pass (e.g. wrong word count) --
+    appended to the same user turn rather than a fresh conversation, so the model still
+    has the original note in context.
+
+    Returns (raw_text, sources) -- raw_text still has the SCORE line for the caller to
+    parse; sources is whatever real citations grounded this particular call (may be
+    empty if the model didn't need to search).
     """
     url = f"{API_BASE}/{TEXT_MODEL}:generateContent?key={API_KEY}"
+    user_text = f"Raw note from Meera's Telegram notes channel:\n\n{note_text}"
+    if revision_note:
+        user_text += f"\n\nRevision needed: {revision_note}"
+
     payload = {
         "system_instruction": {"parts": [{"text": system_prompt}]},
-        "contents": [
-            {
-                "role": "user",
-                "parts": [{"text": f"Raw note from Meera's Telegram notes channel:\n\n{note_text}"}],
-            }
-        ],
+        "contents": [{"role": "user", "parts": [{"text": user_text}]}],
         "tools": [{"google_search": {}}],
         "generationConfig": {"temperature": 0.7},
     }
@@ -44,8 +72,42 @@ def generate_post_text(system_prompt, note_text):
     candidates = data.get("candidates") or []
     if not candidates:
         raise RuntimeError(f"Gemini returned no candidates: {data}")
-    parts = candidates[0]["content"]["parts"]
-    return "".join(p.get("text", "") for p in parts).strip()
+    candidate = candidates[0]
+    parts = candidate["content"]["parts"]
+    text = "".join(p.get("text", "") for p in parts).strip()
+    return text, _extract_sources(candidate)
+
+
+def find_reference(note_text):
+    """
+    Dedicated search for one real, relevant article or piece of research related to the
+    note's topic -- separate from generate_post_text's incidental grounding, so a
+    reference search always actually happens rather than depending on whether the model
+    felt it needed to search while drafting. Returns only verified sources from the
+    API's grounding metadata (see _extract_sources) -- never model-written citation text.
+    """
+    url = f"{API_BASE}/{TEXT_MODEL}:generateContent?key={API_KEY}"
+    prompt = f"""Search for one real, relevant article, study, or piece of research that relates to
+the topic below, suitable as a supporting reference for a skincare-science LinkedIn post. Prefer
+dermatology/cosmetic-chemistry sources, but any genuinely relevant real source is acceptable.
+Briefly name what you found in one sentence.
+
+TOPIC:
+{note_text}"""
+    resp = requests.post(
+        url,
+        json={
+            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+            "tools": [{"google_search": {}}],
+        },
+        timeout=45,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    candidates = data.get("candidates") or []
+    if not candidates:
+        return []
+    return _extract_sources(candidates[0])
 
 
 def generate_visual_concept(draft_text):

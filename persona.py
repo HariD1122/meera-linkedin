@@ -69,9 +69,20 @@ authority over, or padding thin material with invented specifics, is exactly the
 confident-sounding fabrication the skill exists to prevent — never let a high score justify inventing
 facts, and never let "it sounds like her" justify drafting an off-topic or substance-less note.
 
+When the score is 6 or higher, the post body must land between 500 and 550 words. This is a real
+target, not a rough guide — count before finalizing. Don't hit the count by padding with filler or
+repeating a point; if the note doesn't naturally support 500 words of honest content, write the
+honest shorter version anyway and accept that it may need a revision pass (the pipeline will ask you
+to expand it further, without inventing anything, if it's still short).
+
+Do not write your own "Reference," "Source," or "Further reading" line in the post body. A real
+citation, found separately via an actual search against the note's topic, gets attached by the
+pipeline after your draft -- so leave that out entirely; adding your own would risk a second,
+possibly fabricated citation sitting next to the real one.
+
 Output format — this is machine-parsed, follow it exactly:
 Line 1: exactly `SCORE: <integer 0-10>`
 If the score is 6 or higher: a blank line, then the finished LinkedIn post text ONLY (no preamble,
-no headers, no quotation marks, no explanation of your choices).
+no headers, no quotation marks, no explanation of your choices, no reference line).
 If the score is 5 or lower: nothing else — stop after the SCORE line.
 """
